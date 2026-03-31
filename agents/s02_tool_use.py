@@ -23,16 +23,14 @@ import os
 import subprocess
 from pathlib import Path
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 
 load_dotenv(override=True)
 
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+client = genai.Client()
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
@@ -93,41 +91,58 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 # -- The dispatch map: {tool_name: handler} --
 TOOL_HANDLERS = {
-    "bash":       lambda **kw: run_bash(kw["command"]),
-    "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
+    "bash": lambda **kw: run_bash(kw["command"]),
+    "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-    "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
 }
 
-TOOLS = [
+TOOL_DECLARATIONS = [
     {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}},
+                    "required": ["path"]}},
     {"name": "write_file", "description": "Write content to file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                    "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"},
+                                                     "new_text": {"type": "string"}},
+                    "required": ["path", "old_text", "new_text"]}},
 ]
 
 
 def agent_loop(messages: list):
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+        config = types.GenerateContentConfig(
+            system_instruction=SYSTEM,
+            tools=[types.Tool(function_declarations=TOOL_DECLARATIONS)]
         )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        response = client.models.generate_content(
+            model=MODEL, contents=messages, config=config,
+        )
+        parts = response.candidates[0].content.parts
+        messages.append({"role": "model", "parts": parts})
+
+        function_calls = [p for p in parts if p.function_call]
+        if not function_calls:
             return
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                print(f"> {block.name}: {output[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
-        messages.append({"role": "user", "content": results})
+
+        result_parts = []
+        for p in function_calls:
+            fc = p.function_call
+
+            handler = TOOL_HANDLERS.get(fc.name)
+            output = handler(**fc.args) if handler else f"Unknown tool: {fc.name}"
+            print(f"> {fc.name}: {output[:200]}")
+            result_parts.append(types.Part(
+                function_response=types.FunctionResponse(
+                    name=fc.name,
+                    response={"result": output}
+                )
+            ))
+        messages.append({"role": "user", "parts": result_parts})
 
 
 if __name__ == "__main__":
@@ -139,11 +154,9 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
-        history.append({"role": "user", "content": query})
+        history.append({"role": "user", "parts": [{"text": query}]})
         agent_loop(history)
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
+        for part in history[-1]["parts"]:
+            if hasattr(part, "text") and part.text:
+                print(part.text)
         print()

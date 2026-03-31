@@ -236,7 +236,7 @@ def agent_loop(messages):
 git clone https://github.com/shareAI-lab/learn-claude-code
 cd learn-claude-code
 pip install -r requirements.txt
-cp .env.example .env   # 编辑 .env 填入你的 ANTHROPIC_API_KEY
+cp .env .env   # 编辑 .env 填入你的 ANTHROPIC_API_KEY
 
 python agents/s01_agent_loop.py       # 从这里开始
 python agents/s12_worktree_task_isolation.py  # 完整递进终点

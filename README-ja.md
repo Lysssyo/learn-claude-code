@@ -236,7 +236,7 @@ def agent_loop(messages):
 git clone https://github.com/shareAI-lab/learn-claude-code
 cd learn-claude-code
 pip install -r requirements.txt
-cp .env.example .env   # .env を編集して ANTHROPIC_API_KEY を入力
+cp .env .env   # .env を編集して ANTHROPIC_API_KEY を入力
 
 python agents/s01_agent_loop.py       # ここから開始
 python agents/s12_worktree_task_isolation.py  # 全セッションの到達点

@@ -27,28 +27,26 @@ policy, hooks, and lifecycle controls on top.
 import os
 import subprocess
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 
 load_dotenv(override=True)
 
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+client = genai.Client()
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
 
-TOOLS = [{
+bash_func = {
     "name": "bash",
     "description": "Run a shell command.",
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {"command": {"type": "string"}},
         "required": ["command"],
     },
-}]
+}
 
 
 def run_bash(command: str) -> str:
@@ -64,31 +62,52 @@ def run_bash(command: str) -> str:
         return "Error: Timeout (120s)"
 
 
+count = 0
+
+
 # -- The core pattern: a while loop that calls tools until the model stops --
 def agent_loop(messages: list):
+    global count
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+        count += 1
+        print(f"进入{count}次loop")
+
+        config = types.GenerateContentConfig(
+            system_instruction=SYSTEM,
+            tools=[types.Tool(function_declarations=[bash_func])]
         )
-        # Append assistant turn
-        messages.append({"role": "assistant", "content": response.content})
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=messages,
+            config=config,
+        )
+        # Append assistant turn (Google uses "model" role, not "assistant")
+        parts = response.candidates[0].content.parts
+        messages.append({"role": "model", "parts": parts})
+
         # If the model didn't call a tool, we're done
-        if response.stop_reason != "tool_use":
+        function_calls = [p for p in parts if p.function_call]
+        if not function_calls:
             return
+
         # Execute each tool call, collect results
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                print(f"\033[33m$ {block.input['command']}\033[0m")
-                output = run_bash(block.input["command"])
-                print(output[:200])
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": output})
-        messages.append({"role": "user", "content": results})
+        result_parts = []
+        for part in function_calls:
+            fc = part.function_call
+            print(f"\033[33m$ {fc.args['command']}\033[0m")
+            output = run_bash(fc.args["command"])
+            print(output[:200])
+            result_parts.append(types.Part(
+                function_response=types.FunctionResponse(
+                    name=fc.name,
+                    response={"result": output}
+                )
+            ))
+        messages.append({"role": "user", "parts": result_parts})
 
 
 if __name__ == "__main__":
+
     history = []
     while True:
         try:
@@ -97,11 +116,9 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
-        history.append({"role": "user", "content": query})
+        history.append({"role": "user", "parts": [{"text": query}]})
         agent_loop(history)
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
+        for part in history[-1]["parts"]:
+            if hasattr(part, "text") and part.text:
+                print(part.text)
         print()

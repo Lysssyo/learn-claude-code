@@ -43,15 +43,14 @@ import time
 import uuid
 from pathlib import Path
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+client = genai.Client()
 MODEL = os.environ["MODEL_ID"]
 TEAM_DIR = WORKDIR / ".team"
 INBOX_DIR = TEAM_DIR / "inbox"
@@ -152,7 +151,7 @@ def claim_task(task_id: int, owner: str) -> str:
 def make_identity_block(name: str, role: str, team_name: str) -> dict:
     return {
         "role": "user",
-        "content": f"<identity>You are '{name}', role: {role}, team: {team_name}. Continue your work.</identity>",
+        "parts": [{"text": f"<identity>You are '{name}', role: {role}, team: {team_name}. Continue your work.</identity>"}],
     }
 
 
@@ -211,8 +210,8 @@ class TeammateManager:
             f"You are '{name}', role: {role}, team: {team_name}, at {WORKDIR}. "
             f"Use idle tool when you have no more work. You will auto-claim new tasks."
         )
-        messages = [{"role": "user", "content": prompt}]
-        tools = self._teammate_tools()
+        messages = [{"role": "user", "parts": [{"text": prompt}]}]
+        tool_declarations = self._teammate_tools()
 
         while True:
             # -- WORK PHASE: standard agent loop --
@@ -222,37 +221,40 @@ class TeammateManager:
                     if msg.get("type") == "shutdown_request":
                         self._set_status(name, "shutdown")
                         return
-                    messages.append({"role": "user", "content": json.dumps(msg)})
+                    messages.append({"role": "user", "parts": [{"text": json.dumps(msg)}]})
                 try:
-                    response = client.messages.create(
-                        model=MODEL,
-                        system=sys_prompt,
-                        messages=messages,
-                        tools=tools,
-                        max_tokens=8000,
+                    config = types.GenerateContentConfig(
+                        system_instruction=sys_prompt,
+                        tools=[types.Tool(function_declarations=tool_declarations)]
+                    )
+                    response = client.models.generate_content(
+                        model=MODEL, contents=messages, config=config,
                     )
                 except Exception:
                     self._set_status(name, "idle")
                     return
-                messages.append({"role": "assistant", "content": response.content})
-                if response.stop_reason != "tool_use":
+                parts = response.candidates[0].content.parts
+                messages.append({"role": "model", "parts": parts})
+                function_calls = [p for p in parts if p.function_call is not None]
+                if not function_calls:
                     break
-                results = []
+                result_parts = []
                 idle_requested = False
-                for block in response.content:
-                    if block.type == "tool_use":
-                        if block.name == "idle":
-                            idle_requested = True
-                            output = "Entering idle phase. Will poll for new tasks."
-                        else:
-                            output = self._exec(name, block.name, block.input)
-                        print(f"  [{name}] {block.name}: {str(output)[:120]}")
-                        results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": str(output),
-                        })
-                messages.append({"role": "user", "content": results})
+                for p in function_calls:
+                    fc = p.function_call
+                    if fc.name == "idle":
+                        idle_requested = True
+                        output = "Entering idle phase. Will poll for new tasks."
+                    else:
+                        output = self._exec(name, fc.name, fc.args)
+                    print(f"  [{name}] {fc.name}: {str(output)[:120]}")
+                    result_parts.append(types.Part(
+                        function_response=types.FunctionResponse(
+                            name=fc.name,
+                            response={"result": str(output)},
+                        )
+                    ))
+                messages.append({"role": "user", "parts": result_parts})
                 if idle_requested:
                     break
 
@@ -268,7 +270,7 @@ class TeammateManager:
                         if msg.get("type") == "shutdown_request":
                             self._set_status(name, "shutdown")
                             return
-                        messages.append({"role": "user", "content": json.dumps(msg)})
+                        messages.append({"role": "user", "parts": [{"text": json.dumps(msg)}]})
                     resume = True
                     break
                 unclaimed = scan_unclaimed_tasks()
@@ -281,9 +283,9 @@ class TeammateManager:
                     )
                     if len(messages) <= 3:
                         messages.insert(0, make_identity_block(name, role, team_name))
-                        messages.insert(1, {"role": "assistant", "content": f"I am {name}. Continuing."})
-                    messages.append({"role": "user", "content": task_prompt})
-                    messages.append({"role": "assistant", "content": f"Claimed task #{task['id']}. Working on it."})
+                        messages.insert(1, {"role": "model", "parts": [types.Part(text=f"I am {name}. Continuing.")]})
+                    messages.append({"role": "user", "parts": [{"text": task_prompt}]})
+                    messages.append({"role": "model", "parts": [types.Part(text=f"Claimed task #{task['id']}. Working on it.")]})
                     resume = True
                     break
 
@@ -334,25 +336,25 @@ class TeammateManager:
         # these base tools are unchanged from s02
         return [
             {"name": "bash", "description": "Run a shell command.",
-             "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+             "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
             {"name": "read_file", "description": "Read file contents.",
-             "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+             "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
             {"name": "write_file", "description": "Write content to file.",
-             "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+             "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
             {"name": "edit_file", "description": "Replace exact text in file.",
-             "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+             "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
             {"name": "send_message", "description": "Send message to a teammate.",
-             "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}}, "required": ["to", "content"]}},
+             "parameters": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}}, "required": ["to", "content"]}},
             {"name": "read_inbox", "description": "Read and drain your inbox.",
-             "input_schema": {"type": "object", "properties": {}}},
+             "parameters": {"type": "object", "properties": {}}},
             {"name": "shutdown_response", "description": "Respond to a shutdown request.",
-             "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "reason": {"type": "string"}}, "required": ["request_id", "approve"]}},
+             "parameters": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "reason": {"type": "string"}}, "required": ["request_id", "approve"]}},
             {"name": "plan_approval", "description": "Submit a plan for lead approval.",
-             "input_schema": {"type": "object", "properties": {"plan": {"type": "string"}}, "required": ["plan"]}},
+             "parameters": {"type": "object", "properties": {"plan": {"type": "string"}}, "required": ["plan"]}},
             {"name": "idle", "description": "Signal that you have no more work. Enters idle polling phase.",
-             "input_schema": {"type": "object", "properties": {}}},
+             "parameters": {"type": "object", "properties": {}}},
             {"name": "claim_task", "description": "Claim a task from the task board by ID.",
-             "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
+             "parameters": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
         ]
 
     def list_all(self) -> str:
@@ -475,35 +477,35 @@ TOOL_HANDLERS = {
 }
 
 # these base tools are unchanged from s02
-TOOLS = [
+TOOL_DECLARATIONS = [
     {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
     {"name": "write_file", "description": "Write content to file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
     {"name": "spawn_teammate", "description": "Spawn an autonomous teammate.",
-     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}, "role": {"type": "string"}, "prompt": {"type": "string"}}, "required": ["name", "role", "prompt"]}},
+     "parameters": {"type": "object", "properties": {"name": {"type": "string"}, "role": {"type": "string"}, "prompt": {"type": "string"}}, "required": ["name", "role", "prompt"]}},
     {"name": "list_teammates", "description": "List all teammates.",
-     "input_schema": {"type": "object", "properties": {}}},
+     "parameters": {"type": "object", "properties": {}}},
     {"name": "send_message", "description": "Send a message to a teammate.",
-     "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}}, "required": ["to", "content"]}},
+     "parameters": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}}, "required": ["to", "content"]}},
     {"name": "read_inbox", "description": "Read and drain the lead's inbox.",
-     "input_schema": {"type": "object", "properties": {}}},
+     "parameters": {"type": "object", "properties": {}}},
     {"name": "broadcast", "description": "Send a message to all teammates.",
-     "input_schema": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}},
+     "parameters": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}},
     {"name": "shutdown_request", "description": "Request a teammate to shut down.",
-     "input_schema": {"type": "object", "properties": {"teammate": {"type": "string"}}, "required": ["teammate"]}},
+     "parameters": {"type": "object", "properties": {"teammate": {"type": "string"}}, "required": ["teammate"]}},
     {"name": "shutdown_response", "description": "Check shutdown request status.",
-     "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}}, "required": ["request_id"]}},
+     "parameters": {"type": "object", "properties": {"request_id": {"type": "string"}}, "required": ["request_id"]}},
     {"name": "plan_approval", "description": "Approve or reject a teammate's plan.",
-     "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "feedback": {"type": "string"}}, "required": ["request_id", "approve"]}},
+     "parameters": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "feedback": {"type": "string"}}, "required": ["request_id", "approve"]}},
     {"name": "idle", "description": "Enter idle state (for lead -- rarely used).",
-     "input_schema": {"type": "object", "properties": {}}},
+     "parameters": {"type": "object", "properties": {}}},
     {"name": "claim_task", "description": "Claim a task from the board by ID.",
-     "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
+     "parameters": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
 ]
 
 
@@ -513,37 +515,40 @@ def agent_loop(messages: list):
         if inbox:
             messages.append({
                 "role": "user",
-                "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>",
+                "parts": [types.Part(text=f"<inbox>{json.dumps(inbox, indent=2)}</inbox>")],
             })
             messages.append({
-                "role": "assistant",
-                "content": "Noted inbox messages.",
+                "role": "model",
+                "parts": [types.Part(text="Noted inbox messages.")],
             })
-        response = client.messages.create(
-            model=MODEL,
-            system=SYSTEM,
-            messages=messages,
-            tools=TOOLS,
-            max_tokens=8000,
+        config = types.GenerateContentConfig(
+            system_instruction=SYSTEM,
+            tools=[types.Tool(function_declarations=TOOL_DECLARATIONS)]
         )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        response = client.models.generate_content(
+            model=MODEL, contents=messages, config=config,
+        )
+        parts = response.candidates[0].content.parts
+        messages.append({"role": "model", "parts": parts})
+        function_calls = [p for p in parts if p.function_call is not None]
+        if not function_calls:
             return
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": str(output),
-                })
-        messages.append({"role": "user", "content": results})
+        result_parts = []
+        for p in function_calls:
+            fc = p.function_call
+            handler = TOOL_HANDLERS.get(fc.name)
+            try:
+                output = handler(**fc.args) if handler else f"Unknown tool: {fc.name}"
+            except Exception as e:
+                output = f"Error: {e}"
+            print(f"> {fc.name}: {str(output)[:200]}")
+            result_parts.append(types.Part(
+                function_response=types.FunctionResponse(
+                    name=fc.name,
+                    response={"result": str(output)},
+                )
+            ))
+        messages.append({"role": "user", "parts": result_parts})
 
 
 if __name__ == "__main__":
@@ -569,11 +574,9 @@ if __name__ == "__main__":
                 owner = f" @{t['owner']}" if t.get("owner") else ""
                 print(f"  {marker} #{t['id']}: {t['subject']}{owner}")
             continue
-        history.append({"role": "user", "content": query})
+        history.append({"role": "user", "parts": [{"text": query}]})
         agent_loop(history)
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
+        for part in history[-1]["parts"]:
+            if hasattr(part, "text") and part.text:
+                print(part.text)
         print()

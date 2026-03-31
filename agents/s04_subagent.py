@@ -27,16 +27,14 @@ import os
 import subprocess
 from pathlib import Path
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 
 load_dotenv(override=True)
 
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+client = genai.Client()
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use the task tool to delegate exploration or subtasks."
@@ -100,69 +98,94 @@ TOOL_HANDLERS = {
 }
 
 # Child gets all base tools except task (no recursive spawning)
-CHILD_TOOLS = [
+CHILD_TOOL_DECLARATIONS = [
     {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
     {"name": "write_file", "description": "Write content to file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
 ]
 
 
 # -- Subagent: fresh context, filtered tools, summary-only return --
 def run_subagent(prompt: str) -> str:
-    sub_messages = [{"role": "user", "content": prompt}]  # fresh context
+    sub_messages = [{"role": "user", "parts": [{"text": prompt}]}]  # fresh context
+    last_parts = []
     for _ in range(30):  # safety limit
-        response = client.messages.create(
-            model=MODEL, system=SUBAGENT_SYSTEM, messages=sub_messages,
-            tools=CHILD_TOOLS, max_tokens=8000,
+        config = types.GenerateContentConfig(
+            system_instruction=SUBAGENT_SYSTEM,
+            tools=[types.Tool(function_declarations=CHILD_TOOL_DECLARATIONS)]
         )
-        sub_messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        response = client.models.generate_content(
+            model=MODEL, contents=sub_messages, config=config,
+        )
+        last_parts = response.candidates[0].content.parts
+        sub_messages.append({"role": "model", "parts": last_parts})
+        function_calls = [p for p in last_parts if p.function_call is not None]
+        if not function_calls:
             break
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
-        sub_messages.append({"role": "user", "content": results})
+        result_parts = []
+        for p in function_calls:
+            fc = p.function_call
+            handler = TOOL_HANDLERS.get(fc.name)
+            print(f"[subagent] {fc.name} 工具调用，入参：{fc.args}")
+            output = handler(**fc.args) if handler else f"Unknown tool: {fc.name}"
+            print(f"  输出：{output}")
+            result_parts.append(types.Part(
+                function_response=types.FunctionResponse(
+                    name=fc.name,
+                    response={"result": str(output)[:50000]}
+                )
+            ))
+        sub_messages.append({"role": "user", "parts": result_parts})
     # Only the final text returns to the parent -- child context is discarded
-    return "".join(b.text for b in response.content if hasattr(b, "text")) or "(no summary)"
+    summary = "".join(p.text for p in last_parts if hasattr(p, "text") and p.text)
+    return summary or "(no summary)"
 
 
 # -- Parent tools: base tools + task dispatcher --
-PARENT_TOOLS = CHILD_TOOLS + [
+PARENT_TOOL_DECLARATIONS = CHILD_TOOL_DECLARATIONS + [
     {"name": "task", "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
-     "input_schema": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}},
+     "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}, "description": {"type": "string", "description": "Short description of the task"}}, "required": ["prompt"]}},
 ]
 
 
 def agent_loop(messages: list):
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=PARENT_TOOLS, max_tokens=8000,
+        config = types.GenerateContentConfig(
+            system_instruction=SYSTEM,
+            tools=[types.Tool(function_declarations=PARENT_TOOL_DECLARATIONS)]
         )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        response = client.models.generate_content(
+            model=MODEL, contents=messages, config=config,
+        )
+        parts = response.candidates[0].content.parts
+        messages.append({"role": "model", "parts": parts})
+        function_calls = [p for p in parts if p.function_call is not None]
+        if not function_calls:
             return
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                if block.name == "task":
-                    desc = block.input.get("description", "subtask")
-                    print(f"> task ({desc}): {block.input['prompt'][:80]}")
-                    output = run_subagent(block.input["prompt"])
-                else:
-                    handler = TOOL_HANDLERS.get(block.name)
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                print(f"  {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-        messages.append({"role": "user", "content": results})
+        result_parts = []
+        for p in function_calls:
+            fc = p.function_call
+            print(f"[main] {fc.name} 工具调用，入参：{fc.args}")
+            if fc.name == "task":
+                desc = fc.args.get("description", "subtask")
+                print(f"> task ({desc}): {fc.args['prompt'][:80]}")
+                output = run_subagent(fc.args["prompt"])
+            else:
+                handler = TOOL_HANDLERS.get(fc.name)
+                output = handler(**fc.args) if handler else f"Unknown tool: {fc.name}"
+            print(f"  输出  {str(output)[:200]}")
+            result_parts.append(types.Part(
+                function_response=types.FunctionResponse(
+                    name=fc.name,
+                    response={"result": str(output)}
+                )
+            ))
+        messages.append({"role": "user", "parts": result_parts})
 
 
 if __name__ == "__main__":
@@ -174,11 +197,9 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
-        history.append({"role": "user", "content": query})
+        history.append({"role": "user", "parts": [{"text": query}]})
         agent_loop(history)
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
+        for part in history[-1]["parts"]:
+            if hasattr(part, "text") and part.text:
+                print(part.text)
         print()

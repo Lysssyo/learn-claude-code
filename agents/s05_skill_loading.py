@@ -40,19 +40,19 @@ import re
 import subprocess
 from pathlib import Path
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 
 load_dotenv(override=True)
 
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+client = genai.Client()
 MODEL = os.environ["MODEL_ID"]
 SKILLS_DIR = WORKDIR / "skills"
 
+print(f"工作目录：{WORKDIR}")
+print(f"skill目录：{SKILLS_DIR}")
 
 # -- SkillLoader: scan skills/<name>/SKILL.md with YAML frontmatter --
 class SkillLoader:
@@ -63,6 +63,7 @@ class SkillLoader:
 
     def _load_all(self):
         if not self.skills_dir.exists():
+            print("没有读取到skills")
             return
         for f in sorted(self.skills_dir.rglob("SKILL.md")):
             text = f.read_text()
@@ -94,7 +95,7 @@ class SkillLoader:
             if tags:
                 line += f" [{tags}]"
             lines.append(line)
-        return "\n".join(lines)
+        return "\n".join(lines)  # 用换行连接
 
     def get_content(self, name: str) -> str:
         """Layer 2: full skill body returned in tool_result."""
@@ -121,6 +122,7 @@ def safe_path(p: str) -> Path:
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
+
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
@@ -133,6 +135,7 @@ def run_bash(command: str) -> str:
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
+
 def run_read(path: str, limit: int = None) -> str:
     try:
         lines = safe_path(path).read_text().splitlines()
@@ -142,6 +145,7 @@ def run_read(path: str, limit: int = None) -> str:
     except Exception as e:
         return f"Error: {e}"
 
+
 def run_write(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
@@ -150,6 +154,7 @@ def run_write(path: str, content: str) -> str:
         return f"Wrote {len(content)} bytes"
     except Exception as e:
         return f"Error: {e}"
+
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
@@ -164,47 +169,62 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 TOOL_HANDLERS = {
-    "bash":       lambda **kw: run_bash(kw["command"]),
-    "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
+    "bash": lambda **kw: run_bash(kw["command"]),
+    "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
-    "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
     "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
 }
 
-TOOLS = [
+TOOL_DECLARATIONS = [
     {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}},
+                    "required": ["path"]}},
     {"name": "write_file", "description": "Write content to file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                    "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"},
+                                                     "new_text": {"type": "string"}},
+                    "required": ["path", "old_text", "new_text"]}},
     {"name": "load_skill", "description": "Load specialized knowledge by name.",
-     "input_schema": {"type": "object", "properties": {"name": {"type": "string", "description": "Skill name to load"}}, "required": ["name"]}},
+     "parameters": {"type": "object", "properties": {"name": {"type": "string", "description": "Skill name to load"}},
+                    "required": ["name"]}},
 ]
 
 
 def agent_loop(messages: list):
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+        config = types.GenerateContentConfig(
+            system_instruction=SYSTEM,
+            tools=[types.Tool(function_declarations=TOOL_DECLARATIONS)]
         )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        response = client.models.generate_content(
+            model=MODEL, contents=messages, config=config,
+        )
+        parts = response.candidates[0].content.parts
+        messages.append({"role": "model", "parts": parts})
+        parts_with_function_calls = [p for p in parts if p.function_call is not None] # 对于每一个 part，如果有工具调用，那么收集对应的part
+        if not parts_with_function_calls:
             return
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                try:
-                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                except Exception as e:
-                    output = f"Error: {e}"
-                print(f"> {block.name}: {str(output)[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
-        messages.append({"role": "user", "content": results})
+        result_parts = []
+        for p in parts_with_function_calls:
+            fc = p.function_call
+            handler = TOOL_HANDLERS.get(fc.name)
+            try:
+                output = handler(**fc.args) if handler else f"Unknown tool: {fc.name}"
+            except Exception as e:
+                output = f"Error: {e}"
+            print(f"> {fc.name}: {str(output)[:200]}")
+            result_parts.append(types.Part(
+                function_response=types.FunctionResponse(
+                    name=fc.name,
+                    response={"result": str(output)}
+                )
+            ))
+        messages.append({"role": "user", "parts": result_parts})
 
 
 if __name__ == "__main__":
@@ -216,11 +236,9 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
-        history.append({"role": "user", "content": query})
+        history.append({"role": "user", "parts": [{"text": query}]})
         agent_loop(history)
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if hasattr(block, "text"):
-                    print(block.text)
+        for part in history[-1]["parts"]:
+            if hasattr(part, "text") and part.text:
+                print(part.text)
         print()

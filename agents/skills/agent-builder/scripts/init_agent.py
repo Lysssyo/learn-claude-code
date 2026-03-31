@@ -233,8 +233,8 @@ def create_agent(name: str, level: int, output_dir: Path):
     agent_file.write_text(template.format(name=name))
     print(f"Created: {agent_file}")
 
-    # Write .env.example
-    env_file = agent_dir / ".env.example"
+    # Write .env
+    env_file = agent_dir / ".env"
     env_file.write_text(ENV_TEMPLATE)
     print(f"Created: {env_file}")
 
@@ -246,7 +246,7 @@ def create_agent(name: str, level: int, output_dir: Path):
     print(f"\nAgent '{name}' created at {agent_dir}")
     print(f"\nNext steps:")
     print(f"  1. cd {agent_dir}")
-    print(f"  2. cp .env.example .env")
+    print(f"  2. cp .env .env")
     print(f"  3. Edit .env with your API key")
     print(f"  4. pip install anthropic python-dotenv")
     print(f"  5. python {name}.py")
